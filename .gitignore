@@ -16,3 +16,4 @@ native/out
 /.idea
 /build
 /captures
+my-release-key.keystore
