@@ -13,6 +13,9 @@ using namespace std;
 
 static vector<string> rc_list;
 
+#define NEW_INITRC_DIR  "/system/etc/init/hw"
+#define INIT_RC         "init.rc"
+
 static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool writable) {
     auto src_dir = xopen_dir(src_path);
     if (!src_dir) return;
@@ -32,13 +35,13 @@ static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
 
     // First patch init.rc
     {
-        auto src = xopen_file(xopenat(src_fd, "init.rc", O_RDONLY | O_CLOEXEC, 0), "re");
+        auto src = xopen_file(xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0), "re");
         if (!src) return;
-        if (writable) unlinkat(src_fd, "init.rc", 0);
+        if (writable) unlinkat(src_fd, INIT_RC, 0);
         auto dest = xopen_file(
-                xopenat(dest_fd, "init.rc", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
+                xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) return;
-        LOGD("Patching init.rc in %s\n", src_path);
+        LOGD("Patching " INIT_RC " in %s\n", src_path);
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
             // Do not start vaultkeeper
             if (str_contains(line, "start vaultkeeper")) {
@@ -73,24 +76,7 @@ static void patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         rc_list.clear();
 
         // Inject Magisk rc scripts
-        LOGD("Inject magisk rc\n");
-        fprintf(dest.get(), R"EOF(
-on post-fs-data
-    start logd
-    exec %2$s 0 0 -- %1$s/magisk --post-fs-data
-
-on property:vold.decrypt=trigger_restart_framework
-    exec %2$s 0 0 -- %1$s/magisk --service
-
-on nonencrypted
-    exec %2$s 0 0 -- %1$s/magisk --service
-
-on property:sys.boot_completed=1
-    exec %2$s 0 0 -- %1$s/magisk --boot-complete
-
-on property:init.svc.zygote=stopped
-    exec %2$s 0 0 -- %1$s/magisk --zygote-restart
-)EOF", tmp_path, MAGISK_PROC_CON);
+        rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
 
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
@@ -110,8 +96,8 @@ on property:init.svc.zygote=stopped
             if (line.starts_with("service zygote ")) {
                 LOGD("Inject zygote restart\n");
                 fprintf(dest.get(), "%s", line.data());
-                fprintf(dest.get(), "    onrestart exec %2$s 0 0 -- %1$s/magisk --zygote-restart\n",
-                        tmp_path, MAGISK_PROC_CON);
+                fprintf(dest.get(),
+                        "    onrestart exec " MAGISK_PROC_CON " 0 0 -- %s/magisk --zygote-restart\n", tmp_path);
                 return true;
             }
             fprintf(dest.get(), "%s", line.data());
@@ -127,7 +113,7 @@ static void load_overlay_rc(const char *overlay) {
 
     int dfd = dirfd(dir.get());
     // Do not allow overwrite init.rc
-    unlinkat(dfd, "init.rc", 0);
+    unlinkat(dfd, INIT_RC, 0);
 
     // '/' + name + '\0'
     char buf[NAME_MAX + 2];
@@ -209,7 +195,7 @@ static void extract_files(bool sbin) {
         mmap_data magisk(m32);
         unlink(m32);
         int fd = xopen("magisk32", O_WRONLY | O_CREAT, 0755);
-        fd_channel ch(fd);
+        fd_stream ch(fd);
         unxz(ch, magisk);
         close(fd);
     }
@@ -217,7 +203,7 @@ static void extract_files(bool sbin) {
         mmap_data magisk(m64);
         unlink(m64);
         int fd = xopen("magisk64", O_WRONLY | O_CREAT, 0755);
-        fd_channel ch(fd);
+        fd_stream ch(fd);
         unxz(ch, magisk);
         close(fd);
         xsymlink("./magisk64", "magisk");
@@ -228,7 +214,7 @@ static void extract_files(bool sbin) {
         mmap_data stub(stub_xz);
         unlink(stub_xz);
         int fd = xopen("stub.apk", O_WRONLY | O_CREAT, 0);
-        fd_channel ch(fd);
+        fd_stream ch(fd);
         unxz(ch, stub);
         close(fd);
     }
@@ -243,9 +229,6 @@ void MagiskInit::parse_config_file() {
         return true;
     });
 }
-
-#define ROOTMIR         MIRRDIR "/system_root"
-#define NEW_INITRC_DIR  "/system/etc/init/hw"
 
 void MagiskInit::patch_ro_root() {
     mount_list.emplace_back("/data");
@@ -266,10 +249,10 @@ void MagiskInit::patch_ro_root() {
 
     if (tmp_dir == "/sbin") {
         // Recreate original sbin structure
-        xmkdir(ROOTMIR, 0755);
-        xmount("/", ROOTMIR, nullptr, MS_BIND, nullptr);
-        recreate_sbin(ROOTMIR "/sbin", true);
-        xumount2(ROOTMIR, MNT_DETACH);
+        xmkdir(MIRRDIR, 0755);
+        xmount("/", MIRRDIR, nullptr, MS_BIND, nullptr);
+        recreate_sbin(MIRRDIR "/sbin", true);
+        xumount2(MIRRDIR, MNT_DETACH);
     } else {
         // Restore debug_ramdisk
         xmount("/data/debug_ramdisk", "/debug_ramdisk", nullptr, MS_MOVE, nullptr);
@@ -301,7 +284,7 @@ void MagiskInit::patch_ro_root() {
     }
 
     // Patch init.rc
-    if (access(NEW_INITRC_DIR, F_OK) == 0) {
+    if (access(NEW_INITRC_DIR "/" INIT_RC, F_OK) == 0) {
         // Android 11's new init.rc
         patch_rc_scripts(NEW_INITRC_DIR, tmp_dir.data(), false);
     } else {
@@ -402,6 +385,6 @@ int magisk_proxy_main(int argc, char *argv[]) {
 
     // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);
-    execv("/sbin/magisk", argv);
+    execve("/sbin/magisk", argv, environ);
     return 1;
 }
